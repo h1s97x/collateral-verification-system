@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getSupabaseClient } from '@/storage/database/supabase-client';
+import { getDb } from '@/storage/database/db';
+import { collateralRecords, verificationLogs } from '@/storage/database/shared/schema';
+import { eq, inArray } from 'drizzle-orm';
 
 // 核对逻辑：模拟与省大数据局数据接口对接进行状态核对
 // 实际生产环境中，此处应调用省局提供的数据接口进行比对
@@ -12,8 +14,6 @@ async function verifyWithProvincialSystem(record: {
   mortgage_amount: string | null;
   estimated_value: string | null;
 }) {
-  // 模拟省局接口核对逻辑
-  // 实际场景中应替换为真实接口调用
   const mockResults: Record<string, string> = {
     '有效': '核对一致',
     '注销': '核对一致',
@@ -21,7 +21,6 @@ async function verifyWithProvincialSystem(record: {
     '待核实': '核对异常',
   };
 
-  // 模拟接口延迟
   await new Promise((resolve) => setTimeout(resolve, 200 + Math.random() * 300));
 
   const result = mockResults[record.status] || '核对异常';
@@ -43,87 +42,85 @@ async function verifyWithProvincialSystem(record: {
 }
 
 export async function POST(request: NextRequest) {
-  const client = getSupabaseClient();
-  const body = await request.json();
-  const { record_ids, verified_by } = body as {
-    record_ids: string[];
-    verified_by?: string;
-  };
+  try {
+    const db = getDb();
+    const body = await request.json();
+    const { record_ids, verified_by } = body as {
+      record_ids: string[];
+      verified_by?: string;
+    };
 
-  if (!record_ids?.length) {
-    return NextResponse.json({ error: '请选择需要核对的记录' }, { status: 400 });
-  }
+    if (!record_ids?.length) {
+      return NextResponse.json({ error: '请选择需要核对的记录' }, { status: 400 });
+    }
 
-  // 获取待核对记录
-  const { data: records, error: fetchError } = await client
-    .from('collateral_records')
-    .select('id, mortgage_no, property_no, owner_name, status, mortgage_amount, estimated_value')
-    .in('id', record_ids);
+    // 获取待核对记录
+    const records = await db
+      .select({
+        id: collateralRecords.id,
+        mortgage_no: collateralRecords.mortgage_no,
+        property_no: collateralRecords.property_no,
+        owner_name: collateralRecords.owner_name,
+        status: collateralRecords.status,
+        mortgage_amount: collateralRecords.mortgage_amount,
+        estimated_value: collateralRecords.estimated_value,
+      })
+      .from(collateralRecords)
+      .where(inArray(collateralRecords.id, record_ids));
 
-  if (fetchError) {
-    return NextResponse.json({ error: `查询记录失败: ${fetchError.message}` }, { status: 500 });
-  }
+    if (!records?.length) {
+      return NextResponse.json({ error: '未找到指定记录' }, { status: 404 });
+    }
 
-  if (!records?.length) {
-    return NextResponse.json({ error: '未找到指定记录' }, { status: 404 });
-  }
+    const results: Array<{
+      record_id: string;
+      mortgage_no: string;
+      verification_result: string;
+      discrepancies: string | null;
+    }> = [];
 
-  const results: Array<{
-    record_id: string;
-    mortgage_no: string;
-    verification_result: string;
-    discrepancies: string | null;
-  }> = [];
+    for (const record of records) {
+      const verifyResult = await verifyWithProvincialSystem(record);
 
-  // 逐条核对
-  for (const record of records) {
-    const verifyResult = await verifyWithProvincialSystem(record);
-
-    // 写入核对日志
-    const { error: logError } = await client
-      .from('verification_logs')
-      .insert({
+      // 写入核对日志
+      await db.insert(verificationLogs).values({
         record_id: record.id,
         verification_type: '自动核对',
         verification_result: verifyResult.verification_result,
         discrepancies: verifyResult.discrepancies,
         verified_by: verified_by || '系统',
-        verified_at: new Date().toISOString(),
+        verified_at: new Date(),
       });
 
-    if (logError) {
-      console.error(`写入核对日志失败: ${logError.message}`);
+      // 更新记录核对状态
+      await db
+        .update(collateralRecords)
+        .set({
+          verification_status: verifyResult.verification_result,
+          last_verified_at: new Date(),
+          updated_at: new Date(),
+        })
+        .where(eq(collateralRecords.id, record.id));
+
+      results.push({
+        record_id: record.id,
+        mortgage_no: record.mortgage_no,
+        verification_result: verifyResult.verification_result,
+        discrepancies: verifyResult.discrepancies,
+      });
     }
 
-    // 更新记录核对状态
-    const { error: updateError } = await client
-      .from('collateral_records')
-      .update({
-        verification_status: verifyResult.verification_result,
-        last_verified_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', record.id);
-
-    if (updateError) {
-      console.error(`更新核对状态失败: ${updateError.message}`);
-    }
-
-    results.push({
-      record_id: record.id,
-      mortgage_no: record.mortgage_no,
-      verification_result: verifyResult.verification_result,
-      discrepancies: verifyResult.discrepancies,
+    return NextResponse.json({
+      data: results,
+      summary: {
+        total: results.length,
+        consistent: results.filter((r) => r.verification_result === '核对一致').length,
+        inconsistent: results.filter((r) => r.verification_result === '核对不一致').length,
+        error: results.filter((r) => r.verification_result === '核对异常').length,
+      },
     });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : '核对失败';
+    return NextResponse.json({ error: `核对失败: ${message}` }, { status: 500 });
   }
-
-  return NextResponse.json({
-    data: results,
-    summary: {
-      total: results.length,
-      consistent: results.filter((r) => r.verification_result === '核对一致').length,
-      inconsistent: results.filter((r) => r.verification_result === '核对不一致').length,
-      error: results.filter((r) => r.verification_result === '核对异常').length,
-    },
-  });
 }

@@ -11,7 +11,7 @@
 - **Language**: TypeScript 5
 - **UI 组件**: shadcn/ui (基于 Radix UI)
 - **Styling**: Tailwind CSS 4
-- **Database**: Supabase (PostgreSQL)
+- **Database**: PostgreSQL (Drizzle ORM 直连，已从 Supabase SDK 迁移)
 
 ## 目录结构
 
@@ -40,9 +40,15 @@
 │   │   ├── types.ts            # 类型定义
 │   │   └── utils.ts            # 工具函数
 │   └── storage/database/
-│       ├── supabase-client.ts  # Supabase 客户端
-│       └── shared/schema.ts    # Drizzle Schema
-```
+│       ├── db.ts                 # Drizzle ORM 数据库客户端（直连 PostgreSQL）
+│       ├── supabase-client.ts   # Supabase 客户端（已弃用，保留兼容）
+│       └── shared/schema.ts     # Drizzle Schema
+├── docker/
+│   ├── init.sql                 # 数据库初始化脚本
+│   └── nginx.conf               # Nginx 反向代理配置
+├── Dockerfile                   # 多阶段构建镜像
+├── docker-compose.yml           # 容器编排（App + PG + Nginx）
+└── .env.example                 # 环境变量模板
 
 ## 数据库表
 
@@ -75,18 +81,57 @@
 ## 编码规范
 
 - TypeScript strict 模式，禁止隐式 any
-- 字段名使用 snake_case（与数据库一致）
-- Supabase 操作必须检查 `{ data, error }`，error 必须 throw
+- 字段名使用 snake_case（与数据库一致），Drizzle schema 使用 camelCase
+- 数据库操作统一使用 Drizzle ORM（`db` 实例），禁止使用 Supabase SDK
+- 所有数据库操作必须 try/catch，错误信息统一格式
 - 中文 URL 参数需 URL 编码
+
+## 私有化部署
+
+### 快速启动
+
+```bash
+# 1. 复制环境变量
+cp .env.example .env
+# 2. 编辑 .env，设置数据库密码等
+# 3. 一键启动
+docker-compose up -d
+# 4. 访问 http://localhost
+```
+
+### 架构说明
+
+| 容器 | 说明 | 端口 |
+|------|------|------|
+| collateral-nginx | Nginx 反向代理 | 80 |
+| collateral-app | Next.js 应用 | 3000 |
+| collateral-db | PostgreSQL 15 | 5432 |
+
+### 数据库直连
+
+数据层已从 Supabase SDK 迁移到 Drizzle ORM 直连 PostgreSQL：
+- 连接串通过 `DATABASE_URL` 环境变量配置
+- 连接池最大 20 连接，空闲超时 30s
+- `docker/init.sql` 包含建表 + 索引 + 种子数据
+
+### 行内 SSO 对接（待实施）
+
+身份认证计划对接行内统一 SSO 系统：
+- 环境变量模板已预留 `SSO_*` 配置项（见 `.env.example`）
+- 实施时需新增 `/api/auth/*` 接口，对接行内 SSO 协议（SAML/OAuth2/CAS）
+- 所有 API 接口增加 SSO session 校验
+- 按角色分级：普通操作员（只读+核对）、管理员（录入+导出+同步）
 
 ## 后续迭代方案
 
 ### P0 — 安全与合规（上线硬性前提）
 
-1. **接入登录认证**
-   - 对接 Supabase Auth，实现账号密码/政务统一认证登录
+1. **对接行内 SSO 认证**
+   - 确认行内 SSO 协议类型（SAML/OAuth2/CAS），获取接入文档
+   - 实现 `/api/auth/login`、`/api/auth/callback`、`/api/auth/logout` 接口
+   - 新增 `users` 表同步 SSO 用户信息
+   - 所有 API 接口增加 session 校验
    - 按角色分级：普通操作员（只读+核对）、管理员（录入+导出+同步）
-   - 所有 API 接口增加 session 校验（`x-session` Header）
 
 2. **操作审计日志**
    - 新增 `operation_logs` 表，记录所有增删改操作
@@ -126,4 +171,3 @@
 8. **移动端适配优化**
    - 核对操作、查询等高频场景适配触屏交互
    - 考虑 PWA 离线缓存
-- 避免嵌套查询（PostgREST schema cache 问题），改用两次查询 + Map 组装
